@@ -3,7 +3,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TupleSections #-}
@@ -24,10 +23,10 @@ import Prelude hiding (seq, (<>))
 -- Lang
 
 data Lang :: * -> * -> * where
-  Return :: a -> Lang c a
   Lit :: c -> Lang c ()
   Sum :: [Lang c a] -> Lang c a
   (:.:) :: Lang c a -> Lang c b -> Lang c (a, b)
+  Return :: a -> Lang c a
   Map :: (a -> b) -> Lang c a -> Lang c b
   Bind :: Lang c a -> (a -> Lang c b) -> Lang c b
 
@@ -50,14 +49,14 @@ instance Show c => Show (Lang c a) where
 -- Smart constructors / instances
 
 (<>) :: Lang c a -> Lang c b -> Lang c (a, b)
-(<>) Void _ = Void
-(<>) _ Void = Void
-(<>) (Return a) x = (a,) <$> x
-(<>) x (Return a) = (,a) <$> x
-(<>) (Map f x) (Map g y) = (f *** g) <$> x <> y
-(<>) (Map f x) y = first f <$> x <> y
-(<>) x (Map f y) = second f <$> x <> y
-(<>) x y = x :.: y
+Void <> _ = Void
+_ <> Void = Void
+Return a <> x = (a,) <$> x
+x <> Return a = (,a) <$> x
+Map f x <> Map g y = (f *** g) <$> x <> y
+Map f x <> y = first f <$> x <> y
+x <> Map f y = second f <$> x <> y
+x <> y = x :.: y
 
 instance Functor (Lang c) where
   fmap _ Void = Void
@@ -71,8 +70,6 @@ instance Applicative (Lang c) where
 
 instance Alternative (Lang c) where
   empty = Sum []
-  Void <|> y = y
-  x <|> Void = x
   Sum xs <|> Sum ys = Sum (xs ++ ys)
   Sum xs <|> y = Sum (xs ++ [y])
   x <|> Sum ys = Sum (x : ys)
@@ -101,9 +98,11 @@ delta Void = const Void
 delta (Return _) = const Void
 delta (Lit c) = \c' -> if c == c' then pure () else Void
 delta (Sum xs) = \c -> asum $ map (`delta` c) xs
-delta (x :.: y) = \c -> asum $ (delta x c <> y) : [(a,) <$> delta y c | a <- nu x]
 delta (Map f x) = (f <$>) . delta x
-delta (Bind x f) = \c -> asum $ (delta x c >>= f) : [delta (f a) c | a <- nu x]
+delta (x :.: y) =
+  \c -> asum $ (delta x c <> y) : [delta ((a,) <$> y) c | a <- nu x]
+delta (Bind x f) =
+  \c -> asum $ (delta x c >>= f) : [delta (f a) c | a <- nu x]
 
 -- Folds with delta
 
@@ -142,10 +141,7 @@ instance Applicative Gen where
 
 instance Monad Gen where
   return = Gen . pure . Just
-  x >>= f = Gen $ do
-    unGen x >>= \case
-      Just a -> unGen (f a)
-      Nothing -> pure Nothing
+  x >>= f = Gen $ unGen x >>= maybe (pure Nothing) (unGen . f)
 
 sample :: Lang c a -> Gen a
 sample (Lit _) = pure ()
