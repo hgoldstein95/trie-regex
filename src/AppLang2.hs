@@ -1,13 +1,12 @@
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE UndecidableInstances #-}
 
 module AppLang where
 
@@ -16,10 +15,9 @@ import Control.Arrow (Arrow (first, second), (***))
 import Control.Monad (ap, replicateM)
 import Data.Foldable (asum)
 import Data.List (genericLength, intercalate)
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Test.QuickCheck (Gen, elements, oneof)
 import qualified Test.QuickCheck as QC
 import Prelude hiding (seq, (<>))
 
@@ -29,14 +27,13 @@ data Lang :: * -> * -> * where
   Return :: a -> Lang c a
   Lit :: c -> Lang c ()
   Sum :: [Lang c a] -> Lang c a
-  (:*:) :: Lang c a -> Lang c b -> Lang c (a, b)
+  (:.:) :: Lang c a -> Lang c b -> Lang c (a, b)
   Map :: (a -> b) -> Lang c a -> Lang c b
+  Bind :: Lang c a -> (a -> Lang c b) -> Lang c b
 
 -- Void as a synonym for Sum []
 
-void :: Lang c a
-void = Sum []
-
+pattern Void :: Lang c a
 pattern Void = Sum []
 
 -- Show
@@ -45,31 +42,32 @@ instance Show c => Show (Lang c a) where
   show (Return _) = "ε"
   show (Lit c) = show c
   show Void = "∅"
-  show (Sum ls) = "(" ++ intercalate " + " (map show ls) ++ ")"
-  show ((:*:) l1 l2) = show l1 ++ " " ++ show l2
+  show (Sum xs) = "(" ++ intercalate " + " (map show xs) ++ ")"
+  show (x :.: y) = show x ++ " " ++ show y
   show (Map _ l) = show l
+  show (Bind _ _) = "(... >>= ...)"
 
 -- Smart constructors / instances
 
 (<>) :: Lang c a -> Lang c b -> Lang c (a, b)
 (<>) Void _ = Void
 (<>) _ Void = Void
-(<>) (Return x) l = (x,) <$> l
-(<>) l (Return x) = (,x) <$> l
-(<>) (Map f l1) (Map g l2) = (f *** g) <$> l1 <> l2
-(<>) (Map f l1) l2 = first f <$> l1 <> l2
-(<>) l1 (Map f l2) = second f <$> l1 <> l2
-(<>) l1 l2 = l1 :*: l2
+(<>) (Return a) x = (a,) <$> x
+(<>) x (Return a) = (,a) <$> x
+(<>) (Map f x) (Map g y) = (f *** g) <$> x <> y
+(<>) (Map f x) y = first f <$> x <> y
+(<>) x (Map f y) = second f <$> x <> y
+(<>) x y = x :.: y
 
 instance Functor (Lang c) where
   fmap _ Void = Void
-  fmap f (Return x) = Return (f x)
-  fmap f (Map g l) = fmap (f . g) l
-  fmap f l = Map f l
+  fmap f (Return a) = Return (f a)
+  fmap f (Map g x) = fmap (f . g) x
+  fmap f x = Map f x
 
 instance Applicative (Lang c) where
   pure = Return
-  l1 <*> l2 = uncurry ($) <$> (l1 <> l2)
+  x <*> y = uncurry ($) <$> (x <> y)
 
 instance Alternative (Lang c) where
   empty = Sum []
@@ -80,71 +78,84 @@ instance Alternative (Lang c) where
   x <|> Sum ys = Sum (x : ys)
   x <|> y = Sum [x, y]
 
+instance Monad (Lang c) where
+  return = pure
+  Void >>= _ = Void
+  Return a >>= f = f a
+  Map g a >>= f = a >>= f . g
+  x >>= f = Bind x f
+
 -- Nullability and Derivatives
 
 nu :: Lang c a -> [a] -- This is an Alternative homomorphism into list!
 nu (Lit _) = empty
 nu Void = empty
-nu (Return x) = pure x
-nu (Sum ls) = foldl1 (<|>) (map nu ls)
-nu (l1 :*: l2) = (,) <$> nu l1 <*> nu l2
-nu (Map f l) = fmap f (nu l)
+nu (Return a) = pure a
+nu (Sum xs) = foldl1 (<|>) (map nu xs)
+nu (x :.: y) = (,) <$> nu x <*> nu y
+nu (Map f x) = fmap f (nu x)
+nu (Bind x f) = nu x >>= nu . f
 
 delta :: Eq c => Lang c a -> c -> Lang c a
 delta Void = const Void
 delta (Return _) = const Void
 delta (Lit c) = \c' -> if c == c' then pure () else Void
-delta (Sum ls) = \c -> asum $ map (`delta` c) ls
-delta (l1 :*: l2) = \c ->
-  asum $
-    (delta l1 c <> l2) :
-      [(x,) <$> delta l2 c | x <- nu l1]
-delta (Map f l) = (f <$>) . delta l
+delta (Sum xs) = \c -> asum $ map (`delta` c) xs
+delta (x :.: y) = \c -> asum $ (delta x c <> y) : [(a,) <$> delta y c | a <- nu x]
+delta (Map f x) = (f <$>) . delta x
+delta (Bind x f) = \c -> asum $ (delta x c >>= f) : [delta (f a) c | a <- nu x]
 
 -- Folds with delta
 
 contains :: (Eq a, Eq c) => Lang c a -> [c] -> [a]
-contains t = nu . foldl delta t
+contains x = nu . foldl delta x
 
 measure :: Eq c => [c] -> Lang c a -> Integer
 measure _ Void = 0
-measure alpha l =
-  genericLength (nu l)
-    + sum [measure alpha (delta l c) | c <- alpha]
+measure alpha x =
+  genericLength (nu x)
+    + sum [measure alpha (delta x c) | c <- alpha]
 
 enumerate :: (Eq c, Ord a) => [c] -> Lang c a -> Set a
 enumerate _ Void = Set.empty
-enumerate alpha l =
-  Set.fromList (nu l)
-    `Set.union` Set.unions [enumerate alpha (delta l c) | c <- alpha]
+enumerate alpha x =
+  Set.fromList (nu x)
+    `Set.union` Set.unions [enumerate alpha (delta x c) | c <- alpha]
 
 -- Gen and MCTS
 
-newtype Gen' a = Gen' {unGen' :: Gen (Maybe a)}
+newtype Gen a = Gen {unGen :: QC.Gen (Maybe a)}
   deriving (Functor)
 
-generate :: Gen' a -> IO (Maybe a)
-generate = QC.generate . unGen'
+oneof :: [Gen a] -> Gen a
+oneof = Gen . QC.oneof . (unGen <$>)
 
-instance Applicative Gen' where
+gfail :: Gen a
+gfail = Gen (pure Nothing)
+
+generate :: Gen a -> IO (Maybe a)
+generate = QC.generate . unGen
+
+instance Applicative Gen where
   pure = return
   (<*>) = ap
 
-instance Monad Gen' where
-  return = Gen' . pure . Just
-  (Gen' x) >>= f = Gen' $ do
-    x >>= \case
-      Just a -> unGen' (f a)
+instance Monad Gen where
+  return = Gen . pure . Just
+  x >>= f = Gen $ do
+    unGen x >>= \case
+      Just a -> unGen (f a)
       Nothing -> pure Nothing
 
-sample :: Lang c a -> Gen' a
-sample (Lit c) = pure ()
-sample Void = Gen' (pure Nothing)
+sample :: Lang c a -> Gen a
+sample (Lit _) = pure ()
+sample Void = gfail
 sample (Return a) = pure a
-sample (Sum []) = Gen' (pure Nothing)
-sample (Sum xs) = Gen' . oneof . (unGen' . sample <$>) $ xs
-sample (x :*: y) = (,) <$> sample x <*> sample y
+sample (Sum []) = gfail
+sample (Sum xs) = oneof (sample <$> xs)
+sample (x :.: y) = (,) <$> sample x <*> sample y
 sample (Map f x) = f <$> sample x
+sample (Bind x f) = sample x >>= sample . f
 
 mcts :: Ord a => Int -> (a -> Bool) -> Lang c a -> IO (Set a)
 mcts n p =
@@ -161,14 +172,12 @@ choiceFitness ::
   Lang c a ->
   IO [(c, Double)]
 choiceFitness alpha n p l =
-  normalize
-    <$> mapM
-      (\c -> fmap ((c,) . Set.size) . mcts n p . delta l $ c)
-      alpha
+  zip alpha . normalize
+    <$> mapM ((Set.size <$>) . mcts n p . delta l) alpha
   where
     normalize cs =
-      let s = fromIntegral $ sum (snd <$> cs)
-       in second ((/ s) . fromIntegral) <$> cs
+      let s = fromIntegral (sum cs)
+       in (/ s) . fromIntegral <$> cs
 
 ---------------------------------------
 -- Examples
@@ -190,8 +199,8 @@ genPair =
 
 pairAlpha :: [Choice]
 pairAlpha =
-  [Choice ("first", show n) | n <- [0, 1, 2]]
-    ++ [Choice ("second", show n) | n <- [0, 1, 2]]
+  [Choice ("first", show n) | n <- [0 :: Int, 1, 2]]
+    ++ [Choice ("second", show n) | n <- [0 :: Int, 1, 2]]
 
 data Tree = Node Tree Int Tree | Leaf
   deriving (Eq, Ord, Show)
@@ -201,27 +210,50 @@ toList Leaf = []
 toList (Node l x r) = toList l ++ [x] ++ toList r
 
 isBST :: Tree -> Bool
+isBST Leaf = True
 isBST (Node l x r) =
   isBST l
     && isBST r
     && all (< x) (toList l)
     && all (> x) (toList r)
-isBST Leaf = True
 
 genTree :: Lang Choice Tree
-genTree = aux 4
+genTree = aux (4 :: Int)
   where
     aux 0 = pure Leaf
     aux n =
       select
         "Tree"
         [ ("leaf", pure Leaf),
-          ("node", node <$> genInt <*> aux (n - 1) <*> aux (n - 1))
+          ( "node",
+            do
+              x <- genInt
+              l <- aux (n - 1)
+              r <- aux (n - 1)
+              pure (Node l x r)
+          )
         ]
     genInt = select "Num" [(show n, pure n) | n <- [0 .. 9]]
-    node x l r = Node l x r
+
+genBST :: Lang Choice Tree
+genBST = aux 0 9
+  where
+    aux mn mx | mn > mx = pure Leaf
+    aux mn mx =
+      select
+        "Tree"
+        [ ("leaf", pure Leaf),
+          ( "node",
+            do
+              x <- genInt mn mx
+              l <- aux mn (x - 1)
+              r <- aux (x + 1) mx
+              pure (Node l x r)
+          )
+        ]
+    genInt mn mx = select "Num" [(show n, pure n) | n <- [mn .. mx]]
 
 treeAlpha :: [Choice]
 treeAlpha =
   [Choice ("Tree", "leaf"), Choice ("Tree", "node")]
-    ++ [Choice ("Num", show n) | n <- [0 .. 9]]
+    ++ [Choice ("Num", show n) | n <- [0 :: Int .. 9]]
