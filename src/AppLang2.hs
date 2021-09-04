@@ -18,7 +18,13 @@ import Data.Maybe (catMaybes)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Test.QuickCheck as QC
-import Prelude hiding (seq, (<>))
+import Text.Printf (printf)
+
+class Joinable (f :: * -> *) where
+  (><) :: f a -> f b -> f (a, b)
+
+instance Joinable [] where
+  (><) = zip
 
 -- Lang
 
@@ -29,6 +35,15 @@ data Lang :: * -> * -> * where
   Return :: a -> Lang c a
   Map :: (a -> b) -> Lang c a -> Lang c b
   Bind :: Lang c a -> (a -> Lang c b) -> Lang c b
+
+-- TODO: Could add a boolean tag for isApplicative in the type
+isApplicative :: Lang c a -> Bool
+isApplicative (Lit _) = True
+isApplicative (Sum xs) = all isApplicative xs
+isApplicative (x :.: y) = isApplicative x && isApplicative y
+isApplicative (Return _) = True
+isApplicative (Map _ x) = isApplicative x
+isApplicative (Bind _ _) = False
 
 -- Void as a synonym for Sum []
 
@@ -48,15 +63,15 @@ instance Show c => Show (Lang c a) where
 
 -- Smart constructors / instances
 
-(<>) :: Lang c a -> Lang c b -> Lang c (a, b)
-Void <> _ = Void
-_ <> Void = Void
-Return a <> x = (a,) <$> x
-x <> Return a = (,a) <$> x
-Map f x <> Map g y = (f *** g) <$> x <> y
-Map f x <> y = first f <$> x <> y
-x <> Map f y = second f <$> x <> y
-x <> y = x :.: y
+instance Joinable (Lang c) where
+  Void >< _ = Void
+  _ >< Void = Void
+  Return a >< x = (a,) <$> x
+  x >< Return a = (,a) <$> x
+  Map f x >< Map g y = (f *** g) <$> x >< y
+  Map f x >< y = first f <$> x >< y
+  x >< Map f y = second f <$> x >< y
+  x >< y = x :.: y
 
 instance Functor (Lang c) where
   fmap _ Void = Void
@@ -66,7 +81,7 @@ instance Functor (Lang c) where
 
 instance Applicative (Lang c) where
   pure = Return
-  x <*> y = uncurry ($) <$> (x <> y)
+  x <*> y = uncurry ($) <$> (x >< y)
 
 instance Alternative (Lang c) where
   empty = Sum []
@@ -89,7 +104,7 @@ nu (Lit _) = empty
 nu Void = empty
 nu (Return a) = pure a
 nu (Sum xs) = foldl1 (<|>) (map nu xs)
-nu (x :.: y) = (,) <$> nu x <*> nu y
+nu (x :.: y) = nu x >< nu y
 nu (Map f x) = fmap f (nu x)
 nu (Bind x f) = nu x >>= nu . f
 
@@ -100,7 +115,7 @@ delta (Lit c) = \c' -> if c == c' then pure () else Void
 delta (Sum xs) = \c -> asum $ map (`delta` c) xs
 delta (Map f x) = (f <$>) . delta x
 delta (x :.: y) =
-  \c -> asum $ (delta x c <> y) : [delta ((a,) <$> y) c | a <- nu x]
+  \c -> asum $ (delta x c >< y) : [delta ((a,) <$> y) c | a <- nu x]
 delta (Bind x f) =
   \c -> asum $ (delta x c >>= f) : [delta (f a) c | a <- nu x]
 
@@ -143,13 +158,16 @@ instance Monad Gen where
   return = Gen . pure . Just
   x >>= f = Gen $ unGen x >>= maybe (pure Nothing) (unGen . f)
 
+instance Joinable Gen where
+  x >< y = (,) <$> x <*> y
+
 sample :: Lang c a -> Gen a
 sample (Lit _) = pure ()
 sample Void = gfail
 sample (Return a) = pure a
 sample (Sum []) = gfail
 sample (Sum xs) = oneof (sample <$> xs)
-sample (x :.: y) = (,) <$> sample x <*> sample y
+sample (x :.: y) = sample x >< sample y
 sample (Map f x) = f <$> sample x
 sample (Bind x f) = sample x >>= sample . f
 
@@ -160,43 +178,78 @@ mcts n p =
     . generate
     . sample
 
+newtype ChoiceFitness c = ChoiceFitness [(c, Double)]
+
+instance Show c => Show (ChoiceFitness c) where
+  show (ChoiceFitness []) = ""
+  show (ChoiceFitness ((c, d) : cs)) = show c ++ ":\t" ++ printf "%.4f" d ++ "\n" ++ show (ChoiceFitness cs)
+
 choiceFitness ::
   (Eq c, Ord c, Ord a) =>
   [c] ->
   Int ->
   (a -> Bool) ->
   Lang c a ->
-  IO [(c, Double)]
-choiceFitness alpha n p l =
-  zip alpha . normalize
-    <$> mapM ((Set.size <$>) . mcts n p . delta l) alpha
+  IO (ChoiceFitness c, Set a)
+choiceFitness alpha n p l = do
+  s <- mapM (mcts n p . delta l) alpha
+  let ds = zip alpha . normalize . map Set.size $ s
+  pure (ChoiceFitness ds, Set.unions s)
   where
     normalize cs =
       let s = fromIntegral (sum cs)
-       in (/ s) . fromIntegral <$> cs
+       in if s == 0 then 1 <$ cs else (/ s) . fromIntegral <$> cs
+
+-- Off the deep end?
+
+goalTotal :: Int
+goalTotal = 10000
+
+naiveGen :: (Ord a, Ord c) => (a -> Bool) -> Lang c a -> IO (Set a)
+naiveGen p g = aux Set.empty
+  where
+    aux acc | Set.size acc >= goalTotal = pure acc
+    aux acc = do
+      x <- generate $ sample g
+      case x of
+        Just a | p a -> aux (Set.insert a acc)
+        _ -> aux acc
+
+derivGen :: (Ord a, Ord c) => [c] -> (a -> Bool) -> Lang c a -> IO (Set a)
+derivGen alpha p initG = aux Set.empty initG
+  where
+    aux acc _ | Set.size acc >= goalTotal = pure acc
+    aux acc Void = aux acc initG
+    aux acc g = do
+      (f, s) <- choiceFitness alpha sampleSize p g
+      c <- QC.generate $ pickChar f
+      aux (Set.unions [acc, s, Set.fromList . filter p . nu $ g]) (delta g c)
+    pickChar (ChoiceFitness cs) =
+      QC.frequency [(round (d * fromIntegral sampleSize), pure c) | (c, d) <- cs]
+    sampleSize = 100
 
 ---------------------------------------
 -- Examples
 ---------------------------------------
 
-newtype Choice = Choice (String, String)
+newtype Choice = Choice String
   deriving (Eq, Ord)
 
 instance Show Choice where
-  show (Choice (t, l)) = t ++ "_" ++ l
+  show (Choice t) = t
 
-select :: String -> [(String, Lang Choice a)] -> Lang Choice a
-select s = asum . map (\(i, l) -> Lit (Choice (s, i)) *> l)
+select :: [(String, Lang Choice a)] -> Lang Choice a
+select = asum . map (\(i, l) -> Lit (Choice i) *> l)
 
 genPair :: Lang Choice (Int, Int)
 genPair =
-  (,) <$> select "first" [(show n, pure n) | n <- [0, 1, 2]]
-    <*> select "second" [(show n, pure n) | n <- [0, 1, 2]]
+  (,) <$> select [("first_" ++ show n, pure n) | n <- [0, 1, 2]]
+    <*> select [("second_" ++ show n, pure n) | n <- [0, 1, 2]]
 
 pairAlpha :: [Choice]
 pairAlpha =
-  [Choice ("first", show n) | n <- [0 :: Int, 1, 2]]
-    ++ [Choice ("second", show n) | n <- [0 :: Int, 1, 2]]
+  [Choice ("first_" ++ show n) | n <- [0 :: Int, 1, 2]]
+    ++ [Choice ("second_" ++ show n) | n <- [0 :: Int, 1, 2]]
 
 data Tree = Node Tree Int Tree | Leaf
   deriving (Eq, Ord, Show)
@@ -214,13 +267,14 @@ isBST (Node l x r) =
     && all (> x) (toList r)
 
 genTree :: Lang Choice Tree
-genTree = aux (4 :: Int)
+genTree = aux (5 :: Int)
   where
     aux 0 = pure Leaf
     aux n =
       select
-        "Tree"
-        [ ("leaf", pure Leaf),
+        [ ( "leaf",
+            pure Leaf
+          ),
           ( "node",
             do
               x <- genInt
@@ -229,7 +283,7 @@ genTree = aux (4 :: Int)
               pure (Node l x r)
           )
         ]
-    genInt = select "Num" [(show n, pure n) | n <- [0 .. 9]]
+    genInt = select [(show n, pure n) | n <- [0 .. 9]]
 
 genBST :: Lang Choice Tree
 genBST = aux 0 9
@@ -237,8 +291,9 @@ genBST = aux 0 9
     aux mn mx | mn > mx = pure Leaf
     aux mn mx =
       select
-        "Tree"
-        [ ("leaf", pure Leaf),
+        [ ( "leaf",
+            pure Leaf
+          ),
           ( "node",
             do
               x <- genInt mn mx
@@ -247,9 +302,9 @@ genBST = aux 0 9
               pure (Node l x r)
           )
         ]
-    genInt mn mx = select "Num" [(show n, pure n) | n <- [mn .. mx]]
+    genInt mn mx = select [(show n, pure n) | n <- [mn .. mx]]
 
 treeAlpha :: [Choice]
 treeAlpha =
-  [Choice ("Tree", "leaf"), Choice ("Tree", "node")]
-    ++ [Choice ("Num", show n) | n <- [0 :: Int .. 9]]
+  [Choice "leaf", Choice "node"]
+    ++ [Choice (show n) | n <- [0 :: Int .. 9]]
